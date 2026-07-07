@@ -1,0 +1,1248 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Manutenção + Ferramentas Interativas - MediaPipe</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"></script>
+    <script src="https://apis.google.com/js/api.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        #video_input { position: absolute; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #canvas_overlay { position: absolute; width: 100%; height: 100%; }
+        #status { position: absolute; top: 15px; left: 15px; color: #0f0; font-size: 14px; background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 8px; pointer-events: none; z-index: 10; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 20px; background: rgba(0,0,0,0.8); padding: 20px 30px; border-radius: 12px; z-index: 20; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="loading">A iniciar câmara e MediaPipe...</div>
+        <div id="status">Aguarda mão...</div>
+        <video id="video_input" playsinline></video>
+        <canvas id="canvas_overlay"></canvas>
+    </div>
+
+    <script>
+        const PINCH_THRESHOLD = 0.05, PINCH_COOLDOWN = 400, PALM_HOLD_MS = 800;
+        const MENU_WIDTH = 280, ITEM_HEIGHT = 52, HEADER_HEIGHT = 46;
+        const SUBMENU_WIDTH = 260, PANEL_WIDTH = 420, PANEL_HEIGHT = 340;
+        const TOOLBOX_WIDTH = 340, TOOLBOX_COLS = 3, TOOL_SIZE = 80, TOOL_PADDING = 15;
+
+        let videoElement, canvasElement, canvasCtx, hands, camera, isLoaded = false, audioCtx = null;
+        let menuOpen = false, submenuOpen = false, submenuParentIndex = -1, menuX = 0, menuY = 0, submenuX = 0, submenuY = 0, submenuHeight = 0;
+        let palmStartTime = null, palmTriggered = false, lastPinchTime = 0, isPinching = false, pointerX = 0, pointerY = 0;
+        let activePanel = null, panelAnimProgress = 0, panelTargetProgress = 0;
+        let toolboxOpen = false, toolboxX = 0, toolboxY = 0, holdingTool = null, selectedToolIdx = -1;
+        let hammerSwing = 0, lastPointerY = 0, swingVelocity = 0, toolEffects = [];
+
+        // === TABUA E PREGOS VIRTUAIS ===
+        let board = { x: 0, y: 0, width: 500, height: 80, visible: false };
+        let nails = [];
+        let boardNailCount = 0;
+        const NAIL_WIDTH = 12, NAIL_HEIGHT = 50, NAIL_HEAD_SIZE = 22;
+        const BOARD_COLOR = '#8B4513', BOARD_BORDER = '#5D2906';
+        const NAIL_COLOR = '#C0C0C0', NAIL_HEAD_COLOR = '#A9A9A9';
+        const NAIL_HAMMER_DEPTH = 12; // quanto desce por martelada
+        // === MODELO DE CLASSIFICAÇÃO DE EQUIPAMENTOS ===
+        let tmModel = null, tmMaxPredictions = 5, tmLabels = [], tmBehaviours = [];
+        let tmRunning = false, tmPrediction = null, tmConfidence = 0;
+        let tmLastPredictionTime = 0, tmPredictionInterval = 300; // ms between predictions
+        let tmPanelVisible = false, tmPanelAnim = 0, tmPanelTarget = 0;
+        const TM_PANEL_WIDTH = 320, TM_PANEL_HEIGHT = 120;
+        // === DADOS DE FÉRIAS (GOOGLE SHEETS) ===
+        const SHEET_ID = '1H5_oQls_Syun-iucaPFzz4mrI-9V4So0hF1UhAVbKWI';
+        const SHEET_TAB = 'Equipa';
+        const API_KEY = ''; // PREENCHER COM A TUA API KEY DO GOOGLE CLOUD
+        const MODEL_BASE_PATH = './'; // Caminho para model.json e weights.bin (ex: './modelo/' ou 'https://teachablemachine.withgoogle.com/models/XYZ/')
+        let vacationData = null;
+        let vacationPanelOpen = false, vacationPanelAnim = 0, vacationPanelTarget = 0;
+        const VACATION_PANEL_WIDTH = 380, VACATION_PANEL_HEIGHT = 280;
+        let vacationRefreshInterval = null;
+        // === SAMPLES (FOTOS DE REFERÊNCIA) ===
+        const SAMPLES_FOLDER = './samples/'; // pasta com fotos dos equipamentos
+        let sampleImages = {}; // cache de imagens carregadas
+        let samplePanelOpen = false, samplePanelAnim = 0, samplePanelTarget = 0;
+        const SAMPLE_PANEL_WIDTH = 400, SAMPLE_PANEL_HEIGHT = 320;
+        const NAIL_MAX_HITS = 4; // marteladas para pregar totalmente
+
+        function initBoard() {
+            board.width = Math.min(500, canvasElement.width * 0.7);
+            board.x = (canvasElement.width - board.width) / 2;
+            board.y = canvasElement.height - 140;
+            spawnNails();
+        }
+
+        function spawnNails() {
+            nails = [];
+            const count = Math.floor(board.width / 70);
+            const spacing = board.width / (count + 1);
+            for (let i = 0; i < count; i++) {
+                nails.push({
+                    x: board.x + spacing * (i + 1),
+                    y: board.y - NAIL_HEIGHT + 10,
+                    width: NAIL_WIDTH,
+                    height: NAIL_HEIGHT,
+                    headSize: NAIL_HEAD_SIZE,
+                    hits: 0,
+                    maxHits: NAIL_MAX_HITS,
+                    sunk: 0,
+                    wobble: 0,
+                    active: true
+                });
+            }
+            boardNailCount = count;
+        }
+
+        function checkHammerHit() {
+            if (!holdingTool || holdingTool.key !== 'martelo' || hammerSwing <= 0.3) return;
+            const hammerX = holdingTool.x;
+            const hammerY = holdingTool.y + 40; // ponta do martelo
+
+            for (let nail of nails) {
+                if (!nail.active) continue;
+                const dx = Math.abs(hammerX - nail.x);
+                const dy = Math.abs(hammerY - (nail.y + nail.sunk));
+                if (dx < 30 && dy < 50) {
+                    nail.hits++;
+                    nail.sunk += NAIL_HAMMER_DEPTH;
+                    nail.wobble = 5;
+                    // Som de martelar no prego
+                    playSound('nail');
+                    // Efeitos de partículas de madeira
+                    for (let p = 0; p < 6; p++) {
+                        toolEffects.push({
+                            type: 'woodchip',
+                            x: nail.x + (Math.random() - 0.5) * 10,
+                            y: board.y + Math.random() * 5,
+                            vx: (Math.random() - 0.5) * 8,
+                            vy: -Math.random() * 6 - 2,
+                            life: 1, maxLife: 1,
+                            size: 3 + Math.random() * 3,
+                            color: '#DEB887'
+                        });
+                    }
+                    // Faíscas metálicas
+                    for (let p = 0; p < 4; p++) {
+                        toolEffects.push({
+                            type: 'spark',
+                            x: nail.x,
+                            y: nail.y + nail.sunk,
+                            vx: (Math.random() - 0.5) * 6,
+                            vy: -Math.random() * 4 - 1,
+                            life: 1, maxLife: 1,
+                            size: 2 + Math.random() * 2,
+                            color: '#FFD700'
+                        });
+                    }
+                    if (nail.hits >= nail.maxHits) {
+                        nail.active = false;
+                        boardNailCount--;
+                        // Efeito de prego pregado
+                        for (let p = 0; p < 10; p++) {
+                            toolEffects.push({
+                                type: 'spark',
+                                x: nail.x,
+                                y: board.y,
+                                vx: (Math.random() - 0.5) * 10,
+                                vy: -Math.random() * 8,
+                                life: 1, maxLife: 1,
+                                size: 3 + Math.random() * 3,
+                                color: '#FF6B35'
+                            });
+                        }
+                        // Se todos pregados, respawn após 1.5s
+                        if (boardNailCount <= 0) {
+                            setTimeout(spawnNails, 1500);
+                        }
+                    }
+                    break; // só acerta um de cada vez
+                }
+            }
+        }
+
+        const simulatedData = {
+            mtbf: { title: 'MTBF / MTTR', type: 'bars', color: '#00b8d4', items: [
+                { label: 'Compressor A', mtbf: 1450, mttr: 2.5 }, { label: 'Bomba H1', mtbf: 980, mttr: 4.2 },
+                { label: 'Motor M3', mtbf: 2100, mttr: 1.8 }, { label: 'Esteira L2', mtbf: 760, mttr: 5.5 },
+                { label: 'Gerador G1', mtbf: 3200, mttr: 3.1 } ] },
+            disponibilidade: { title: 'Disponibilidade', type: 'gauge', color: '#2979ff', items: [
+                { label: 'Linha 1', value: 94.2 }, { label: 'Linha 2', value: 87.5 },
+                { label: 'Linha 3', value: 96.1 }, { label: 'Linha 4', value: 91.3 } ] },
+            oee: { title: 'OEE - Eficiência Global', type: 'gauge', color: '#d500f9', items: [
+                { label: 'Setor A', value: 78.4 }, { label: 'Setor B', value: 82.1 },
+                { label: 'Setor C', value: 69.7 }, { label: 'Setor D', value: 91.2 } ] },
+            custo: { title: 'Custo Manutenção', type: 'bars', color: '#ff9100', items: [
+                { label: 'Jan', value: 12500 }, { label: 'Fev', value: 8400 }, { label: 'Mar', value: 15200 },
+                { label: 'Abr', value: 9800 }, { label: 'Mai', value: 11300 }, { label: 'Jun', value: 7600 } ] },
+            ativos: { title: 'Lista de Ativos', type: 'list', color: '#2979ff', items: [
+                { label: 'Compressor A', status: 'OK', last: '2 dias' }, { label: 'Bomba H1', status: 'Alerta', last: 'Hoje' },
+                { label: 'Motor M3', status: 'OK', last: '5 dias' }, { label: 'Esteira L2', status: 'Crítico', last: 'Agora' },
+                { label: 'Gerador G1', status: 'OK', last: '1 dia' }, { label: 'Válvula V4', status: 'OK', last: '3 dias' },
+                { label: 'Sensor S2', status: 'Alerta', last: 'Ontem' } ] },
+            tarefas: { title: 'Tarefas Pendentes', type: 'list', color: '#d500f9', items: [
+                { label: 'Lubrificar motor M3', prio: 'Alta', due: 'Hoje' }, { label: 'Substituir filtro H1', prio: 'Média', due: 'Amanhã' },
+                { label: 'Calibração balança', prio: 'Baixa', due: '3 dias' }, { label: 'Verificar tensões G1', prio: 'Alta', due: 'Hoje' },
+                { label: 'Inspeção esteira L2', prio: 'Crítica', due: 'Agora' } ] },
+            historico: { title: 'Histórico de Intervenções', type: 'list', color: '#2979ff', items: [
+                { label: 'Reparação Compressor A', date: '01/07/2026', type: 'Corretiva' },
+                { label: 'Lubrificação Geral', date: '28/06/2026', type: 'Preventiva' },
+                { label: 'Substituição rolamento M3', date: '25/06/2026', type: 'Corretiva' },
+                { label: 'Calibração sensores', date: '22/06/2026', type: 'Preventiva' },
+                { label: 'Limpeza filtros', date: '20/06/2026', type: 'Preventiva' } ] }
+        };
+
+        const menuItems = [
+            { label: 'Preventiva', icon: '🔧', color: '#00c853', sub: ['Inspeção Visual', 'Lubrificação', 'Calibração', 'Substituição Filtros', 'Verificação Tensões', 'Limpeza Equipamento'] },
+            { label: 'Corretiva', icon: '⚠️', color: '#ff9100', sub: ['Avaria Mecânica', 'Falha Elétrica', 'Substituição Peça', 'Reparação Urgente', 'Diagnóstico'] },
+            { label: 'Equipamentos', icon: '🏭', color: '#2979ff', sub: ['Lista Ativos', 'Histórico', 'Ficha Técnica', 'Localização', 'QR Code Scan'] },
+            { label: 'Tarefas', icon: '📋', color: '#d500f9', sub: ['Pendentes', 'Em Curso', 'Concluídas', 'Agendar', 'Relatório'] },
+            { label: 'Relatórios', icon: '📊', color: '#00b8d4', sub: ['MTBF / MTTR', 'Custo Manutenção', 'Disponibilidade', 'OEE', 'Exportar PDF'] },
+            { label: 'Ferramentas', icon: '🧰', color: '#ff6b35', sub: ['Mala Virtual'] },
+            { label: 'Definições', icon: '⚙️', color: '#78909c', sub: ['Utilizadores', 'Notificações', 'Backup', 'Idioma', 'Férias', 'Sobre'] },
+        ];
+
+        const actionMap = { 'MTBF / MTTR': 'mtbf', 'Disponibilidade': 'disponibilidade', 'OEE': 'oee', 'Custo Manutenção': 'custo', 'Lista Ativos': 'ativos', 'Pendentes': 'tarefas', 'Histórico': 'historico' };
+
+        const tools = [
+            { key: 'martelo', name: 'Martelo', icon: '🔨', color: '#ff6b35', desc: 'Martele para fixar' },
+            { key: 'chave_inglesa', name: 'Chave Inglesa', icon: '🔧', color: '#4fc3f7', desc: 'Aperte porcas' },
+            { key: 'chave_fendas', name: 'Chave de Fendas', icon: '🪛', color: '#aed581', desc: 'Aperte parafusos' },
+            { key: 'alicate', name: 'Alicate', icon: '✂️', color: '#ff8a65', desc: 'Corte ou segure' },
+            { key: 'nivel', name: 'Nível', icon: '📐', color: '#ba68c8', desc: 'Verifique o nível' },
+            { key: 'lanterna', name: 'Lanterna', icon: '🔦', color: '#fff176', desc: 'Ilumine áreas' },
+        ];
+
+        window.onload = () => {
+            videoElement = document.getElementById('video_input');
+            canvasElement = document.getElementById('canvas_overlay');
+            canvasCtx = canvasElement.getContext('2d');
+            const resize = () => { canvasElement.width = window.innerWidth; canvasElement.height = window.innerHeight; if (board) { board.width = Math.min(500, canvasElement.width * 0.7); board.x = (canvasElement.width - board.width) / 2; board.y = canvasElement.height - 140; spawnNails(); } };
+            resize(); window.addEventListener('resize', resize);
+            initAudio(); initTeachableMachine(); loadVacationData(); loadSampleImages(); initMediaPipe(); animate();
+        };
+
+        function initAudio() { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+
+        async function initTeachableMachine() {
+            try {
+                const modelURL = MODEL_BASE_PATH + 'model.json';
+                const metadataURL = MODEL_BASE_PATH + 'metadata.json';
+                const behavioursURL = MODEL_BASE_PATH + 'behaviours.json';
+
+                console.log('A carregar modelo de:', modelURL);
+
+                // Check if files exist first
+                const modelCheck = await fetch(modelURL, { method: 'HEAD' });
+                if (!modelCheck.ok) {
+                    throw new Error(`model.json não encontrado em ${modelURL} (status ${modelCheck.status}). Verifica o caminho MODEL_BASE_PATH.`);
+                }
+
+                // Load model using Teachable Machine image library
+                // This handles the TM-specific model format correctly
+                if (typeof tmImage !== 'undefined') {
+                    tmModel = await tmImage.load(modelURL, metadataURL);
+                    tmMaxPredictions = tmModel.getTotalClasses();
+                    tmLabels = [];
+                    for (let i = 0; i < tmMaxPredictions; i++) {
+                        tmLabels.push(tmModel.getClassLabels()[i]);
+                    }
+                    console.log('✅ Teachable Machine carregado via tmImage! Labels:', tmLabels);
+                } else {
+                    // Fallback: try manual loading
+                    console.log('tmImage não disponível, a tentar carregamento manual...');
+                    tmModel = await tf.loadLayersModel(modelURL);
+
+                    // Load metadata for labels
+                    const metaRes = await fetch(metadataURL);
+                    if (metaRes.ok) {
+                        const metadata = await metaRes.json();
+                        tmLabels = metadata.labels || [];
+                        tmMaxPredictions = tmLabels.length;
+                    }
+                }
+
+                // Load behaviours (optional)
+                try {
+                    const behavRes = await fetch(behavioursURL);
+                    if (behavRes.ok) {
+                        const behavData = await behavRes.json();
+                        tmBehaviours = behavData.behaviours || [];
+                    }
+                } catch (be) {
+                    console.log('behaviours.json não encontrado, usando labels como textos');
+                    tmBehaviours = tmLabels.map(l => ({ label: l, text: { text: l } }));
+                }
+
+                tmRunning = true;
+                console.log('✅ Modelo pronto! Labels:', tmLabels);
+                updateStatus('Modelo IA carregado: ' + tmLabels.join(', '));
+            } catch (e) {
+                console.warn('❌ Teachable Machine não carregado:', e.message);
+                console.warn('DICA: Verifica se model.json, metadata.json e weights.bin estão em:', MODEL_BASE_PATH);
+                console.warn('Erro completo:', e);
+                tmRunning = false;
+                updateStatus('Modelo IA não carregado. Verifica consola (F12)');
+            }
+        }
+
+        // === GOOGLE SHEETS INTEGRATION ===
+        async function loadSampleImages() {
+            if (!tmRunning || tmLabels.length === 0) {
+                console.log('ℹ️ Samples: Modelo não carregado, a aguardar...');
+                setTimeout(loadSampleImages, 3000);
+                return;
+            }
+
+            // Mapeia índice da classe para ficheiro na pasta samples/
+            // Os ficheiros do Teachable Machine seguem o padrão: {classe}_{numero}.png
+            // Usamos o primeiro de cada classe como referência: 0_0.png, 1_0.png, etc.
+            const classToFile = {};
+            tmLabels.forEach((label, idx) => {
+                classToFile[label] = `${idx}_0.png`;
+            });
+
+            console.log('📁 A carregar samples para:', tmLabels);
+            console.log('   Ficheiros esperados:', Object.values(classToFile));
+
+            for (const label of tmLabels) {
+                const filename = classToFile[label];
+                try {
+                    const img = new Image();
+                    img.src = `${SAMPLES_FOLDER}${filename}`;
+                    await new Promise((resolve, reject) => {
+                        img.onload = resolve;
+                        img.onerror = reject;
+                    });
+                    sampleImages[label] = img;
+                    console.log(`✅ Sample carregado: ${filename} (${label})`);
+                } catch (e) {
+                    console.warn(`❌ Sample não encontrado: ${filename} (${label})`);
+                    // Tenta com extensões alternativas
+                    const extensions = ['jpg', 'jpeg', 'webp'];
+                    for (const ext of extensions) {
+                        try {
+                            const altFile = `${filename.split('.')[0]}.${ext}`;
+                            const img = new Image();
+                            img.src = `${SAMPLES_FOLDER}${altFile}`;
+                            await new Promise((resolve, reject) => {
+                                img.onload = resolve;
+                                img.onerror = reject;
+                            });
+                            sampleImages[label] = img;
+                            console.log(`✅ Sample carregado (alt): ${altFile} (${label})`);
+                            break;
+                        } catch (e2) {
+                            // continua para próxima extensão
+                        }
+                    }
+                }
+            }
+
+            console.log(`📸 Total samples carregados: ${Object.keys(sampleImages).length}/${tmLabels.length}`);
+        }
+
+        function openSamplePanel(label) {
+            samplePanelTarget = 1;
+            samplePanelOpen = true;
+            playSound('panel');
+        }
+
+        function closeSamplePanel() {
+            samplePanelTarget = 0;
+            setTimeout(() => { samplePanelOpen = false; }, 400);
+            playSound('close');
+        }
+
+        async function loadVacationData() {
+            if (!API_KEY) {
+                console.log('ℹ️ API_KEY do Google Sheets não configurada.');
+                console.log('   Para usar dados reais:');
+                console.log('   1. Vai a https://console.cloud.google.com/');
+                console.log('   2. Cria API Key e ativa Google Sheets API');
+                console.log('   3. Coloca a chave na variável API_KEY no código');
+                console.log('   A usar dados de demonstração por agora.');
+                vacationData = getDemoVacationData();
+                return;
+            }
+            try {
+                const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${SHEET_TAB}!A:H?key=${API_KEY}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data.values && data.values.length > 1) {
+                    vacationData = parseSheetData(data.values);
+                    console.log('Dados de férias carregados:', vacationData);
+                } else {
+                    vacationData = getDemoVacationData();
+                }
+            } catch (e) {
+                console.warn('Erro ao carregar Sheets:', e);
+                vacationData = getDemoVacationData();
+            }
+        }
+
+        function parseSheetData(rows) {
+            const headers = rows[0];
+            const result = [];
+            for (let i = 1; i < rows.length; i++) {
+                const row = rows[i];
+                if (row.length < 6) continue;
+                result.push({
+                    colaborador: row[0] || '',
+                    setor: row[1] || '',
+                    totalAnual: parseInt(row[2]) || 0,
+                    diasExtra: parseInt(row[3]) || 0,
+                    diasUsados: parseInt(row[4]) || 0,
+                    diasDisponiveis: parseInt(row[5]) || 0,
+                    diasAposFecho: parseInt(row[6]) || 0
+                });
+            }
+            return result;
+        }
+
+        function getDemoVacationData() {
+            console.log('📊 Dados de férias (DEMO):');
+            console.log('   Total Anual: 25 dias');
+            console.log('   Dias Usados: 19 dias');
+            console.log('   Disponíveis: 6 dias');
+            return [
+                { colaborador: 'Demo User', setor: 'Manutenção', totalAnual: 25, diasExtra: 0, diasUsados: 19, diasDisponiveis: 6, diasAposFecho: 6 }
+            ];
+        }
+
+        function openVacationPanel() {
+            if (!vacationData) loadVacationData();
+            vacationPanelTarget = 1;
+            vacationPanelOpen = true;
+            playSound('panel');
+            // Auto-refresh every 30 seconds
+            if (!vacationRefreshInterval) {
+                vacationRefreshInterval = setInterval(loadVacationData, 30000);
+            }
+        }
+
+        function closeVacationPanel() {
+            vacationPanelTarget = 0;
+            setTimeout(() => { vacationPanelOpen = false; }, 400);
+            playSound('close');
+        }
+
+        async function predictEquipment() {
+            if (!tmModel || !tmRunning || !videoElement || videoElement.readyState < 2) return;
+            const now = Date.now();
+            if (now - tmLastPredictionTime < tmPredictionInterval) return;
+            tmLastPredictionTime = now;
+
+            try {
+                let predictions;
+
+                if (typeof tmImage !== 'undefined' && tmModel.predict) {
+                    // Use Teachable Machine predict method
+                    predictions = await tmModel.predict(videoElement);
+                } else {
+                    // Fallback: manual tensor creation
+                    const tensor = tf.browser.fromPixels(videoElement)
+                        .resizeNearestNeighbor([224, 224])
+                        .toFloat()
+                        .div(255.0)
+                        .expandDims(0);
+                    const predData = await tmModel.predict(tensor).data();
+                    tensor.dispose();
+                    predictions = Array.from(predData).map((p, i) => ({
+                        className: tmLabels[i] || `Class ${i}`,
+                        probability: p
+                    }));
+                }
+
+                // Find highest confidence
+                let maxIdx = 0, maxVal = 0;
+                if (Array.isArray(predictions)) {
+                    for (let i = 0; i < predictions.length; i++) {
+                        const prob = predictions[i].probability || predictions[i];
+                        if (prob > maxVal) { maxVal = prob; maxIdx = i; }
+                    }
+                }
+
+                const threshold = 0.65;
+                if (maxVal > threshold) {
+                    const label = tmLabels[maxIdx] || (predictions[maxIdx] && predictions[maxIdx].className) || 'Desconhecido';
+                    const behaviour = tmBehaviours.find(b => b.label === label);
+                    const text = behaviour ? behaviour.text.text : label;
+
+                    if (tmPrediction !== text) {
+                        tmPrediction = text;
+                        tmConfidence = maxVal;
+                        tmPanelTarget = 1;
+                        setTimeout(() => {
+                            if (tmPrediction === text) tmPanelTarget = 0;
+                        }, 4000);
+                    } else {
+                        tmConfidence = maxVal * 0.7 + tmConfidence * 0.3;
+                    }
+                } else {
+                    tmPanelTarget = 0;
+                }
+            } catch (e) {
+                console.warn('Prediction error:', e);
+            }
+        }
+
+        function playSound(type) {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+            osc.connect(gain); gain.connect(audioCtx.destination); const now = audioCtx.currentTime;
+            const sounds = {
+                open: () => { osc.type = 'sine'; osc.frequency.setValueAtTime(440, now); osc.frequency.exponentialRampToValueAtTime(880, now + 0.1); gain.gain.setValueAtTime(0.15, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3); osc.start(now); osc.stop(now + 0.3); },
+                click: () => { osc.type = 'square'; osc.frequency.setValueAtTime(1200, now); gain.gain.setValueAtTime(0.08, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08); osc.start(now); osc.stop(now + 0.08); },
+                close: () => { osc.type = 'sine'; osc.frequency.setValueAtTime(600, now); osc.frequency.exponentialRampToValueAtTime(200, now + 0.15); gain.gain.setValueAtTime(0.12, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2); osc.start(now); osc.stop(now + 0.2); },
+                hover: () => { osc.type = 'triangle'; osc.frequency.setValueAtTime(800, now); gain.gain.setValueAtTime(0.03, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05); osc.start(now); osc.stop(now + 0.05); },
+                panel: () => { osc.type = 'sine'; osc.frequency.setValueAtTime(660, now); osc.frequency.exponentialRampToValueAtTime(990, now + 0.15); gain.gain.setValueAtTime(0.1, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25); osc.start(now); osc.stop(now + 0.25); },
+                grab: () => { osc.type = 'square'; osc.frequency.setValueAtTime(800, now); gain.gain.setValueAtTime(0.1, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1); osc.start(now); osc.stop(now + 0.1); },
+                drop: () => { osc.type = 'sine'; osc.frequency.setValueAtTime(400, now); osc.frequency.exponentialRampToValueAtTime(200, now + 0.15); gain.gain.setValueAtTime(0.12, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2); osc.start(now); osc.stop(now + 0.2); },
+                hammer: () => { osc.type = 'sawtooth'; osc.frequency.setValueAtTime(150, now); gain.gain.setValueAtTime(0.2, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15); osc.start(now); osc.stop(now + 0.15); },
+                nail: () => { osc.type = 'square'; osc.frequency.setValueAtTime(800, now); osc.frequency.exponentialRampToValueAtTime(200, now + 0.1); gain.gain.setValueAtTime(0.15, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12); osc.start(now); osc.stop(now + 0.12); },
+                spark: () => { osc.type = 'square'; osc.frequency.setValueAtTime(2000, now); osc.frequency.exponentialRampToValueAtTime(4000, now + 0.05); gain.gain.setValueAtTime(0.08, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1); osc.start(now); osc.stop(now + 0.1); },
+                wrench: () => { osc.type = 'sine'; osc.frequency.setValueAtTime(300, now); osc.frequency.exponentialRampToValueAtTime(500, now + 0.1); gain.gain.setValueAtTime(0.1, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15); osc.start(now); osc.stop(now + 0.15); },
+                screw: () => { osc.type = 'triangle'; osc.frequency.setValueAtTime(600, now); osc.frequency.linearRampToValueAtTime(800, now + 0.2); gain.gain.setValueAtTime(0.06, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25); osc.start(now); osc.stop(now + 0.25); },
+                snip: () => { osc.type = 'square'; osc.frequency.setValueAtTime(1500, now); gain.gain.setValueAtTime(0.05, now); gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08); osc.start(now); osc.stop(now + 0.08); }
+            };
+            if (sounds[type]) sounds[type]();
+        }
+
+        function logSetupSummary() {
+            console.log('\n=== RESUMO DA CONFIGURAÇÃO ===');
+            console.log('MediaPipe Hands:', isLoaded ? '✅ OK' : '⏳ A carregar...');
+            console.log('Teachable Machine:', tmRunning ? '✅ OK' : '❌ Falhou - verifica ficheiros do modelo');
+            console.log('Google Sheets:', API_KEY ? '✅ Configurado' : 'ℹ️ Usando dados DEMO');
+            console.log('Samples carregados:', Object.keys(sampleImages).length + '/' + tmLabels.length);
+            console.log('==============================\n');
+        }
+
+        function initMediaPipe() {
+            hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+            hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+            hands.onResults(onResults);
+            camera = new Camera(videoElement, { onFrame: async () => { await hands.send({ image: videoElement }); }, width: 1280, height: 720 });
+            camera.start().then(() => { 
+                document.getElementById('loading').style.display = 'none'; 
+                isLoaded = true; 
+                setTimeout(logSetupSummary, 2000); // Log summary after everything loads
+            }).catch(err => { document.getElementById('loading').textContent = 'Erro câmara: ' + err.message; });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (panelTargetProgress > panelAnimProgress) { panelAnimProgress += (panelTargetProgress - panelAnimProgress) * 0.15; if (panelTargetProgress - panelAnimProgress < 0.005) panelAnimProgress = panelTargetProgress; }
+            else if (panelTargetProgress < panelAnimProgress) { panelAnimProgress += (panelTargetProgress - panelAnimProgress) * 0.15; if (panelAnimProgress - panelTargetProgress < 0.005) panelAnimProgress = panelTargetProgress; }
+            // TM panel animation
+            if (tmPanelTarget > tmPanelAnim) { tmPanelAnim += (tmPanelTarget - tmPanelAnim) * 0.12; if (tmPanelTarget - tmPanelAnim < 0.005) tmPanelAnim = tmPanelTarget; }
+            else if (tmPanelTarget < tmPanelAnim) { tmPanelAnim += (tmPanelTarget - tmPanelAnim) * 0.12; if (tmPanelAnim - tmPanelTarget < 0.005) tmPanelAnim = tmPanelTarget; }
+            // Run prediction
+            predictEquipment();
+            // Vacation panel animation
+            if (vacationPanelTarget > vacationPanelAnim) { 
+                vacationPanelAnim += (vacationPanelTarget - vacationPanelAnim) * 0.15; 
+                if (vacationPanelTarget - vacationPanelAnim < 0.005) vacationPanelAnim = vacationPanelTarget; 
+            }
+            else if (vacationPanelTarget < vacationPanelAnim) { 
+                vacationPanelAnim += (vacationPanelTarget - vacationPanelAnim) * 0.15; 
+                if (vacationPanelAnim - vacationPanelTarget < 0.005) vacationPanelAnim = vacationPanelTarget; 
+            }
+            // Sample panel animation
+            if (samplePanelTarget > samplePanelAnim) { 
+                samplePanelAnim += (samplePanelTarget - samplePanelAnim) * 0.15; 
+                if (samplePanelTarget - samplePanelAnim < 0.005) samplePanelAnim = samplePanelTarget; 
+            }
+            else if (samplePanelTarget < samplePanelAnim) { 
+                samplePanelAnim += (samplePanelTarget - samplePanelAnim) * 0.15; 
+                if (samplePanelAnim - samplePanelTarget < 0.005) samplePanelAnim = samplePanelTarget; 
+            }
+        }
+
+        function onResults(results) {
+            canvasCtx.save(); canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    const mirrored = landmarks.map(l => ({ x: 1 - l.x, y: l.y, z: l.z }));
+                    drawConnectors(canvasCtx, mirrored, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 2 });
+                    drawLandmarks(canvasCtx, mirrored, { color: '#FF0000', lineWidth: 1, radius: 3 });
+                    processGestures(mirrored);
+                }
+            } else { palmStartTime = null; palmTriggered = false; updateStatus('Mostra a palma aberta para abrir o menu'); }
+            renderAR(); canvasCtx.restore();
+        }
+
+        let lastHoverIdx = -1, lastHoverSubIdx = -1;
+        let pointerHistory = []; // for swipe detection
+        const SWIPE_FRAMES = 5, SWIPE_DISTANCE = 60;
+        let swipeDebug = '';
+        // Fluid drag-to-dismiss
+        let menuDragOffset = 0, menuDragStartX = 0, menuDragActive = false, menuDragVelocity = 0;
+        const MENU_DISMISS_THRESHOLD = 120;
+        let menuSlideOut = 0, menuSlideDir = 0, menuDismissInProgress = false;
+
+        function detectSwipe() {
+            if (pointerHistory.length < SWIPE_FRAMES) return null;
+            const recent = pointerHistory.slice(-SWIPE_FRAMES);
+            const first = recent[0], last = recent[recent.length - 1];
+            const dx = last.x - first.x, dy = last.y - first.y;
+            swipeDebug = 'dx=' + Math.round(dx) + ' dy=' + Math.round(dy);
+            if (Math.abs(dy) > Math.abs(dx) * 0.7) { swipeDebug += ' VERT'; return null; }
+            if (Math.abs(dx) < SWIPE_DISTANCE) { swipeDebug += ' SHORT'; return null; }
+            swipeDebug += ' SWIPE!';
+            return dx > 0 ? 'right' : 'left';
+        }
+
+        function updateMenuDrag() {
+            if (!menuOpen || submenuOpen || toolboxOpen || activePanel || holdingTool || isPinching) {
+                menuDragActive = false; return;
+            }
+            // Start drag when finger is inside menu area and moves horizontally
+            const mh = getMenuHeight();
+            const inMenu = pointerX >= menuX && pointerX <= menuX + MENU_WIDTH && pointerY >= menuY && pointerY <= menuY + mh;
+            if (!menuDragActive && inMenu && pointerHistory.length >= 3) {
+                const prev = pointerHistory[pointerHistory.length - 2];
+                const dx = pointerX - prev.x, dy = pointerY - prev.y;
+                if (Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+                    menuDragActive = true; menuDragStartX = pointerX; menuDragOffset = 0;
+                }
+            }
+            if (menuDragActive) {
+                menuDragOffset = pointerX - menuDragStartX;
+                // Track velocity for momentum
+                if (pointerHistory.length >= 2) {
+                    const prev = pointerHistory[pointerHistory.length - 2];
+                    menuDragVelocity = (pointerX - prev.x) * 0.5 + menuDragVelocity * 0.5;
+                }
+                // Auto-dismiss if dragged past threshold
+                if (Math.abs(menuDragOffset) > MENU_DISMISS_THRESHOLD && !menuDismissInProgress) {
+                    dismissMenuFluid(menuDragOffset > 0 ? 'right' : 'left');
+                }
+            }
+            // If finger leaves menu area while dragging, keep tracking briefly
+            if (menuDragActive && !inMenu && Math.abs(menuDragOffset) < 30) {
+                menuDragActive = false; menuDragOffset = 0;
+            }
+        }
+
+        function dismissMenuFluid(dir) {
+            if (!menuOpen || menuDismissInProgress) return;
+            menuDismissInProgress = true;
+            menuSlideDir = dir === 'left' ? -1 : 1;
+            const startOffset = menuDragOffset;
+            const startVelocity = menuDragVelocity;
+            const startTime = performance.now();
+            const animateDismiss = (now) => {
+                const t = Math.min((now - startTime) / 350, 1);
+                const ease = 1 - Math.pow(1 - t, 3); // ease out cubic
+                const momentum = startVelocity * 20 * (1 - ease);
+                const targetOffset = (dir === 'left' ? -1 : 1) * (MENU_WIDTH + 200);
+                menuDragOffset = startOffset + (targetOffset - startOffset) * ease + momentum * (1 - ease);
+                if (t < 1) requestAnimationFrame(animateDismiss);
+                else {
+                    menuOpen = false; submenuOpen = false; submenuParentIndex = -1;
+                    menuDragOffset = 0; menuDragActive = false; menuSlideOut = 0;
+                    menuDismissInProgress = false;
+                    palmStartTime = null; palmTriggered = false;
+                }
+            };
+            playSound('close');
+            requestAnimationFrame(animateDismiss);
+        }
+
+        function springBackMenu() {
+            if (!menuDragActive || Math.abs(menuDragOffset) < 2) { menuDragOffset = 0; menuDragActive = false; return; }
+            const start = menuDragOffset;
+            const startTime = performance.now();
+            const animateSpring = (now) => {
+                const t = Math.min((now - startTime) / 250, 1);
+                const ease = 1 - Math.pow(1 - t, 3);
+                menuDragOffset = start * (1 - ease);
+                if (t < 1) requestAnimationFrame(animateSpring);
+                else { menuDragOffset = 0; menuDragActive = false; }
+            };
+            requestAnimationFrame(animateSpring);
+        }
+
+        function processGestures(landmarks) {
+            const indexTip = landmarks[8]; pointerX = indexTip.x * canvasElement.width; pointerY = indexTip.y * canvasElement.height;
+            pointerHistory.push({ x: pointerX, y: pointerY, time: Date.now() });
+            if (pointerHistory.length > SWIPE_FRAMES + 3) pointerHistory.shift();
+            // Fluid drag-to-dismiss
+            updateMenuDrag();
+            // Also detect classic swipe as fallback (only if not already dismissing)
+            if (menuOpen && !submenuOpen && !toolboxOpen && !activePanel && !holdingTool && !menuDismissInProgress) {
+                const swipeDir = detectSwipe();
+                if (swipeDir) { dismissMenuFluid(swipeDir); pointerHistory = []; }
+            }
+            const thumbTip = landmarks[4]; const dx = indexTip.x - thumbTip.x; const dy = indexTip.y - thumbTip.y;
+            const dist = Math.sqrt(dx * dx + dy * dy); const now = Date.now(); const pinching = dist < PINCH_THRESHOLD;
+
+            if (holdingTool) {
+                const velocity = pointerY - lastPointerY;
+                if (holdingTool.key === 'martelo' && velocity > 15 && swingVelocity <= 0) {
+                    hammerSwing = 1; playSound('hammer');
+                    checkHammerHit();
+                    toolEffects.push({ type: 'ripple', x: pointerX, y: pointerY + 40, life: 1, maxLife: 1, radius: 10, color: '#ff6b35' });
+                    for (let i = 0; i < 8; i++) toolEffects.push({ type: 'spark', x: pointerX, y: pointerY + 40, vx: (Math.random() - 0.5) * 10, vy: (Math.random() - 0.5) * 10 - 3, life: 1, maxLife: 1, size: 3 + Math.random() * 3, color: '#ffcc00' });
+                }
+                if (holdingTool.key === 'alicate' && pinching && !isPinching) {
+                    playSound('snip');
+                    for (let i = 0; i < 5; i++) toolEffects.push({ type: 'spark', x: pointerX, y: pointerY, vx: (Math.random() - 0.5) * 8, vy: (Math.random() - 0.5) * 8, life: 1, maxLife: 1, size: 2 + Math.random() * 2, color: '#ff8a65' });
+                }
+                if (holdingTool.key === 'chave_fendas' && Math.abs(velocity) > 8 && Math.random() < 0.3) {
+                    playSound('screw');
+                    toolEffects.push({ type: 'screw', x: pointerX, y: pointerY, angle: Math.random() * Math.PI * 2, life: 1, maxLife: 1, size: 4, color: '#aed581' });
+                }
+                if (holdingTool.key === 'chave_inglesa' && Math.abs(velocity) > 10 && Math.random() < 0.2) {
+                    playSound('wrench');
+                    toolEffects.push({ type: 'bolt', x: pointerX, y: pointerY, life: 1, maxLife: 1, size: 6, color: '#4fc3f7' });
+                }
+                swingVelocity = velocity;
+            }
+            lastPointerY = pointerY;
+
+            if (pinching && !isPinching && (now - lastPinchTime > PINCH_COOLDOWN)) {
+                isPinching = true; lastPinchTime = now;
+                if (menuDragActive && Math.abs(menuDragOffset) < MENU_DISMISS_THRESHOLD) { springBackMenu(); }
+                onPinchClick();
+            }
+            else if (!pinching) { isPinching = false; }
+
+            const isPalmOpen = isHandOpen(landmarks);
+            if (isPalmOpen) {
+                if (menuDragActive && Math.abs(menuDragOffset) < MENU_DISMISS_THRESHOLD) { springBackMenu(); }
+                if (holdingTool && !palmTriggered) { if (!palmStartTime) palmStartTime = now; if (now - palmStartTime >= 1000) { dropTool(); palmTriggered = true; } }
+                else if (!menuOpen && !toolboxOpen && !holdingTool && !palmTriggered) { if (!palmStartTime) palmStartTime = now; if (now - palmStartTime >= PALM_HOLD_MS) { openMenuAt(pointerX, pointerY); palmTriggered = true; } }
+            } else { palmStartTime = null; if (!isPalmOpen && palmTriggered) palmTriggered = false; }
+
+            if (menuOpen && !holdingTool) {
+                const hIdx = getMenuItemAt(pointerX, pointerY); if (hIdx !== lastHoverIdx && hIdx >= 0) { playSound('hover'); lastHoverIdx = hIdx; }
+                const hSubIdx = submenuOpen ? getSubmenuItemAt(pointerX, pointerY) : -1; if (hSubIdx !== lastHoverSubIdx && hSubIdx >= 0) { playSound('hover'); lastHoverSubIdx = hSubIdx; }
+                if (hIdx < 0) lastHoverIdx = -1; if (hSubIdx < 0) lastHoverSubIdx = -1;
+            }
+            if (toolboxOpen && !holdingTool) { const hIdx = getToolAt(pointerX, pointerY); if (hIdx !== lastHoverIdx && hIdx >= 0) { playSound('hover'); lastHoverIdx = hIdx; } if (hIdx < 0) lastHoverIdx = -1; selectedToolIdx = hIdx; }
+
+            if (holdingTool) {
+                holdingTool.x = pointerX + holdingTool.offsetX; holdingTool.y = pointerY + holdingTool.offsetY;
+                const velX = (pointerX - (holdingTool.lastX || pointerX)) * 0.5; holdingTool.rotation = Math.max(-45, Math.min(45, velX)); holdingTool.lastX = pointerX;
+                if (hammerSwing > 0) { hammerSwing -= 0.08; if (hammerSwing < 0) hammerSwing = 0; }
+            }
+
+            if (holdingTool) updateStatus(`Segurando: ${holdingTool.name} | ${holdingTool.desc} | Palma aberta para largar`);
+            else if (toolboxOpen) updateStatus('Mala aberta | Pinça para pegar ferramenta');
+            else if (menuOpen) updateStatus(`Menu aberto | Pinça: ${pinching ? 'SIM' : 'NÃO'} | ${swipeDebug}`);
+            else if (!isPalmOpen) updateStatus('Mostra a palma aberta para abrir o menu');
+        }
+
+        function isHandOpen(landmarks) {
+            const fingers = [[8, 6], [12, 10], [16, 14], [20, 18]]; let extended = 0;
+            for (const [tip, pip] of fingers) { if (landmarks[tip].y < landmarks[pip].y) extended++; }
+            return extended >= 3 && Math.abs(landmarks[4].x - landmarks[3].x) > 0.03;
+        }
+
+        function openMenuAt(x, y) { menuOpen = true; submenuOpen = false; menuDismissInProgress = false; pointerHistory = []; menuX = Math.min(Math.max(x - MENU_WIDTH/2, 10), canvasElement.width - MENU_WIDTH - 10); menuY = Math.min(Math.max(y - 120, 10), canvasElement.height - getMenuHeight() - 10); playSound('open'); }
+        function getMenuHeight() { return HEADER_HEIGHT + menuItems.length * ITEM_HEIGHT + 8; }
+
+        function openSubmenu(index) {
+            submenuOpen = true; submenuParentIndex = index; const items = menuItems[index].sub;
+            submenuHeight = HEADER_HEIGHT + items.length * ITEM_HEIGHT + 8;
+            submenuX = menuX + MENU_WIDTH + 10; submenuY = menuY + HEADER_HEIGHT + index * ITEM_HEIGHT;
+            if (submenuX + SUBMENU_WIDTH > canvasElement.width) submenuX = menuX - SUBMENU_WIDTH - 10;
+            if (submenuY + submenuHeight > canvasElement.height) submenuY = canvasElement.height - submenuHeight - 10;
+            if (submenuY < 10) submenuY = 10; playSound('open');
+        }
+
+
+        function closeMenu() { menuOpen = false; submenuOpen = false; submenuParentIndex = -1; palmStartTime = null; palmTriggered = false; playSound('close'); }
+        function closeSubmenu() { submenuOpen = false; submenuParentIndex = -1; playSound('close'); }
+
+        function openToolbox() { toolboxOpen = true; menuOpen = false; submenuOpen = false; const rows = Math.ceil(tools.length / TOOLBOX_COLS); const h = HEADER_HEIGHT + rows * (TOOL_SIZE + TOOL_PADDING) + TOOL_PADDING * 2; toolboxX = canvasElement.width / 2 - TOOLBOX_WIDTH / 2; toolboxY = canvasElement.height / 2 - h / 2; playSound('open'); }
+        function closeToolbox() { toolboxOpen = false; selectedToolIdx = -1; playSound('close'); }
+
+        function grabTool(idx) { const tool = tools[idx]; holdingTool = { key: tool.key, name: tool.name, icon: tool.icon, color: tool.color, desc: tool.desc, offsetX: 0, offsetY: 0, rotation: 0, scale: 1.5, x: pointerX, y: pointerY, lastX: pointerX }; toolboxOpen = false; selectedToolIdx = -1; playSound('grab'); if (tool.key === 'martelo') { board.visible = true; initBoard(); } }
+        function dropTool() { if (!holdingTool) return; if (holdingTool.key === 'martelo') { board.visible = false; } holdingTool = null; hammerSwing = 0; playSound('drop'); }
+
+        function openPanel(key) { const data = simulatedData[key]; if (!data) return; activePanel = { key: key, title: data.title, type: data.type, color: data.color, data: data, x: canvasElement.width / 2 - PANEL_WIDTH / 2, y: canvasElement.height / 2 - PANEL_HEIGHT / 2 }; panelTargetProgress = 1; playSound('panel'); }
+        function closePanel() { panelTargetProgress = 0; setTimeout(() => { if (panelTargetProgress === 0) activePanel = null; }, 400); playSound('close'); }
+
+        function onPinchClick() {
+            if (samplePanelOpen && samplePanelAnim > 0.5) {
+                const px = (canvasElement.width - SAMPLE_PANEL_WIDTH) / 2;
+                const py = 100;
+                if (isOverSampleX(pointerX, pointerY, px, py, SAMPLE_PANEL_WIDTH)) { closeSamplePanel(); return; }
+            }
+            if (vacationPanelOpen && vacationPanelAnim > 0.5) {
+                const px = canvasElement.width - VACATION_PANEL_WIDTH - 20;
+                const py = 80;
+                if (isOverVacationX(pointerX, pointerY, px, py, VACATION_PANEL_WIDTH)) { closeVacationPanel(); return; }
+            }
+            if (activePanel && panelAnimProgress > 0.5) { if (isOverPanelX(pointerX, pointerY)) { closePanel(); return; } }
+            if (toolboxOpen && selectedToolIdx >= 0) { grabTool(selectedToolIdx); return; }
+            if (toolboxOpen && isOverToolboxX(pointerX, pointerY)) { closeToolbox(); return; }
+            if (!menuOpen) return;
+            if (isOverMenuX(pointerX, pointerY)) { closeMenu(); return; }
+            if (submenuOpen && isOverSubmenuX(pointerX, pointerY)) { closeSubmenu(); return; }
+            if (submenuOpen) {
+                const subIdx = getSubmenuItemAt(pointerX, pointerY);
+                if (subIdx >= 0) { 
+                    const itemLabel = menuItems[submenuParentIndex].sub[subIdx]; 
+                    playSound('click'); 
+                    if (submenuParentIndex === 5 && itemLabel === 'Mala Virtual') { openToolbox(); return; }
+                    if (submenuParentIndex === 6 && itemLabel === 'Férias') { openVacationPanel(); return; }
+                    const dataKey = actionMap[itemLabel]; 
+                    if (dataKey) openPanel(dataKey); 
+                    return; 
+                }
+            }
+            const idx = getMenuItemAt(pointerX, pointerY);
+            if (idx >= 0) { const item = menuItems[idx]; if (item.sub && item.sub.length > 0) { if (submenuOpen && submenuParentIndex === idx) { closeSubmenu(); } else { openSubmenu(idx); } } }
+        }
+
+        function isOverMenuX(x, y) { if (!menuOpen) return false; const slideOffset = menuSlideOut * menuSlideDir * (MENU_WIDTH + 100) + menuDragOffset; const effX = menuX + slideOffset; return x >= effX + MENU_WIDTH - 40 && x <= effX + MENU_WIDTH - 4 && y >= menuY + 4 && y <= menuY + HEADER_HEIGHT - 4; }
+        function isOverSubmenuX(x, y) { return submenuOpen && x >= submenuX + SUBMENU_WIDTH - 40 && x <= submenuX + SUBMENU_WIDTH - 4 && y >= submenuY + 4 && y <= submenuY + HEADER_HEIGHT - 4; }
+        function isOverPanelX(x, y) { if (!activePanel) return false; const px = activePanel.x, py = activePanel.y; return x >= px + PANEL_WIDTH - 44 && x <= px + PANEL_WIDTH - 4 && y >= py + 6 && y <= py + 38; }
+        function isOverToolboxX(x, y) { return toolboxOpen && x >= toolboxX + TOOLBOX_WIDTH - 40 && x <= toolboxX + TOOLBOX_WIDTH - 4 && y >= toolboxY + 4 && y <= toolboxY + HEADER_HEIGHT - 4; }
+        function getMenuItemAt(x, y) { if (!menuOpen) return -1; const slideOffset = menuSlideOut * menuSlideDir * (MENU_WIDTH + 100) + menuDragOffset; const effX = menuX + slideOffset; const mh = getMenuHeight(); if (x < effX || x > effX + MENU_WIDTH || y < menuY + HEADER_HEIGHT || y > menuY + mh) return -1; const idx = Math.floor((y - (menuY + HEADER_HEIGHT)) / ITEM_HEIGHT); return (idx >= 0 && idx < menuItems.length) ? idx : -1; }
+        function getSubmenuItemAt(x, y) { if (!submenuOpen) return -1; if (x < submenuX || x > submenuX + SUBMENU_WIDTH || y < submenuY + HEADER_HEIGHT || y > submenuY + submenuHeight) return -1; const idx = Math.floor((y - (submenuY + HEADER_HEIGHT)) / ITEM_HEIGHT); const count = menuItems[submenuParentIndex].sub.length; return (idx >= 0 && idx < count) ? idx : -1; }
+        function getToolAt(x, y) { if (!toolboxOpen) return -1; const rows = Math.ceil(tools.length / TOOLBOX_COLS); const contentY = toolboxY + HEADER_HEIGHT + TOOL_PADDING; if (x < toolboxX + TOOL_PADDING || x > toolboxX + TOOLBOX_WIDTH - TOOL_PADDING) return -1; if (y < contentY || y > contentY + rows * (TOOL_SIZE + TOOL_PADDING)) return -1; const col = Math.floor((x - (toolboxX + TOOL_PADDING)) / (TOOL_SIZE + TOOL_PADDING)); const row = Math.floor((y - contentY) / (TOOL_SIZE + TOOL_PADDING)); const idx = row * TOOLBOX_COLS + col; return (idx >= 0 && idx < tools.length) ? idx : -1; }
+
+        function renderAR() { updateAndDrawEffects(); drawBoard(); drawTeachableMachinePanel(); drawVacationPanel(); drawSamplePanel(); if (menuOpen) { drawMenu(); if (submenuOpen) drawSubmenu(); } if (toolboxOpen) drawToolbox(); if (activePanel) drawPanel(); if (holdingTool) drawHeldTool(); drawPointer(pointerX, pointerY, isPinching); }
+
+        function updateAndDrawEffects() {
+            for (let i = toolEffects.length - 1; i >= 0; i--) {
+                const e = toolEffects[i]; e.life -= 0.025; if (e.life <= 0) { toolEffects.splice(i, 1); continue; }
+                const alpha = e.life / e.maxLife;
+                if (e.type === 'ripple') { e.radius += 4; canvasCtx.beginPath(); canvasCtx.arc(e.x, e.y, e.radius, 0, Math.PI * 2); canvasCtx.strokeStyle = hexToRgba(e.color, alpha * 0.6); canvasCtx.lineWidth = 3; canvasCtx.stroke(); canvasCtx.beginPath(); canvasCtx.arc(e.x, e.y, e.radius * 0.6, 0, Math.PI * 2); canvasCtx.strokeStyle = hexToRgba(e.color, alpha * 0.3); canvasCtx.lineWidth = 2; canvasCtx.stroke(); }
+                else if (e.type === 'spark') { e.x += e.vx; e.y += e.vy; e.vy += 0.3; canvasCtx.beginPath(); canvasCtx.arc(e.x, e.y, e.size * alpha, 0, Math.PI * 2); canvasCtx.fillStyle = hexToRgba(e.color, alpha); canvasCtx.fill(); canvasCtx.beginPath(); canvasCtx.arc(e.x, e.y, e.size * 2 * alpha, 0, Math.PI * 2); canvasCtx.fillStyle = hexToRgba('#fff', alpha * 0.3); canvasCtx.fill(); }
+                else if (e.type === 'screw') { e.angle += 0.3; e.x += Math.cos(e.angle) * 2; e.y += Math.sin(e.angle) * 2; canvasCtx.save(); canvasCtx.translate(e.x, e.y); canvasCtx.rotate(e.angle); canvasCtx.fillStyle = hexToRgba(e.color, alpha); canvasCtx.fillRect(-e.size/2, -e.size/6, e.size, e.size/3); canvasCtx.restore(); }
+                else if (e.type === 'bolt') { canvasCtx.beginPath(); canvasCtx.arc(e.x, e.y, e.size * (1 - alpha), 0, Math.PI * 2); canvasCtx.fillStyle = hexToRgba(e.color, alpha); canvasCtx.fill(); canvasCtx.beginPath(); for (let j = 0; j < 6; j++) { const a = (j / 6) * Math.PI * 2; const bx = e.x + Math.cos(a) * e.size * 0.5 * (1 - alpha); const by = e.y + Math.sin(a) * e.size * 0.5 * (1 - alpha); if (j === 0) canvasCtx.moveTo(bx, by); else canvasCtx.lineTo(bx, by); } canvasCtx.closePath(); canvasCtx.strokeStyle = hexToRgba('#fff', alpha * 0.5); canvasCtx.lineWidth = 1; canvasCtx.stroke(); }
+                else if (e.type === 'woodchip') { e.x += e.vx; e.y += e.vy; e.vy += 0.4; canvasCtx.beginPath(); canvasCtx.rect(e.x - e.size/2, e.y - e.size/2, e.size, e.size); canvasCtx.fillStyle = hexToRgba(e.color, alpha); canvasCtx.fill(); }
+            }
+        }
+
+        function drawLanternLight() {
+            if (!holdingTool || holdingTool.key !== 'lanterna') return;
+            const x = holdingTool.x, y = holdingTool.y;
+            const grad = canvasCtx.createRadialGradient(x, y, 10, x, y, 200);
+            grad.addColorStop(0, 'rgba(255, 255, 200, 0.25)'); grad.addColorStop(0.3, 'rgba(255, 255, 150, 0.12)'); grad.addColorStop(1, 'rgba(255, 255, 100, 0)');
+            canvasCtx.fillStyle = grad; canvasCtx.beginPath(); canvasCtx.arc(x, y, 200, 0, Math.PI * 2); canvasCtx.fill();
+            const grad2 = canvasCtx.createRadialGradient(x, y, 5, x, y, 60);
+            grad2.addColorStop(0, 'rgba(255, 255, 220, 0.4)'); grad2.addColorStop(1, 'rgba(255, 255, 200, 0)');
+            canvasCtx.fillStyle = grad2; canvasCtx.beginPath(); canvasCtx.arc(x, y, 60, 0, Math.PI * 2); canvasCtx.fill();
+        }
+
+        function drawLevel() {
+            if (!holdingTool || holdingTool.key !== 'nivel') return;
+            const x = holdingTool.x, y = holdingTool.y, rot = holdingTool.rotation;
+            canvasCtx.save(); canvasCtx.translate(x, y + 50); canvasCtx.rotate(rot * Math.PI / 180);
+            const w = 120, h = 30; canvasCtx.fillStyle = 'rgba(186, 104, 200, 0.3)'; roundRect(-w/2, -h/2, w, h, 6, null, true); canvasCtx.strokeStyle = '#ba68c8'; canvasCtx.lineWidth = 2; canvasCtx.stroke();
+            const bubbleX = -rot * 0.8; const clampedX = Math.max(-w/2 + 15, Math.min(w/2 - 15, bubbleX));
+            canvasCtx.beginPath(); canvasCtx.arc(clampedX, 0, 8, 0, Math.PI * 2); canvasCtx.fillStyle = 'rgba(255, 255, 255, 0.7)'; canvasCtx.fill(); canvasCtx.strokeStyle = '#fff'; canvasCtx.lineWidth = 1; canvasCtx.stroke();
+            canvasCtx.strokeStyle = 'rgba(255,255,255,0.3)'; canvasCtx.lineWidth = 1; canvasCtx.beginPath(); canvasCtx.moveTo(-w/2 + 15, -h/2 + 5); canvasCtx.lineTo(-w/2 + 15, h/2 - 5); canvasCtx.moveTo(w/2 - 15, -h/2 + 5); canvasCtx.lineTo(w/2 - 15, h/2 - 5); canvasCtx.stroke();
+            canvasCtx.fillStyle = '#fff'; canvasCtx.font = 'bold 12px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.fillText(`${Math.abs(rot).toFixed(1)}°`, 0, h/2 + 18);
+            canvasCtx.restore();
+        }
+
+        function drawBoard() {
+            if (!board.visible) return;
+            // Sombra da tábua
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.5)';
+            canvasCtx.shadowBlur = 15;
+            canvasCtx.shadowOffsetY = 8;
+            // Tábua
+            roundRect(board.x, board.y, board.width, board.height, 8, BOARD_COLOR, true);
+            canvasCtx.shadowColor = 'transparent';
+            canvasCtx.shadowBlur = 0;
+            // Borda da tábua
+            canvasCtx.strokeStyle = BOARD_BORDER;
+            canvasCtx.lineWidth = 3;
+            roundRect(board.x, board.y, board.width, board.height, 8, null, false);
+            canvasCtx.stroke();
+            // Veios da madeira
+            canvasCtx.strokeStyle = 'rgba(93, 41, 6, 0.3)';
+            canvasCtx.lineWidth = 1;
+            for (let i = 1; i < 4; i++) {
+                const ly = board.y + (board.height * i / 4);
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(board.x + 10, ly);
+                canvasCtx.lineTo(board.x + board.width - 10, ly);
+                canvasCtx.stroke();
+            }
+            // Pregos
+            for (let nail of nails) {
+                if (!nail.active) continue;
+                // Atualizar wobble
+                if (nail.wobble > 0) nail.wobble *= 0.9;
+                if (nail.wobble < 0.1) nail.wobble = 0;
+                const wobbleX = Math.sin(Date.now() / 50) * nail.wobble;
+                const nx = nail.x + wobbleX;
+                const ny = nail.y + nail.sunk;
+                // Corpo do prego
+                canvasCtx.fillStyle = NAIL_COLOR;
+                canvasCtx.fillRect(nx - nail.width/2, ny, nail.width, nail.height - nail.sunk);
+                // Cabeça do prego
+                canvasCtx.fillStyle = NAIL_HEAD_COLOR;
+                canvasCtx.beginPath();
+                canvasCtx.arc(nx, ny, nail.headSize/2, 0, Math.PI * 2);
+                canvasCtx.fill();
+                // Brilho na cabeça
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.4)';
+                canvasCtx.beginPath();
+                canvasCtx.arc(nx - 3, ny - 3, nail.headSize/4, 0, Math.PI * 2);
+                canvasCtx.fill();
+            }
+            // Texto informativo
+            if (boardNailCount > 0) {
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.6)';
+                canvasCtx.font = '12px Segoe UI';
+                canvasCtx.textAlign = 'center';
+                canvasCtx.fillText(`Pregos restantes: ${boardNailCount}`, board.x + board.width/2, board.y + board.height + 20);
+            } else {
+                canvasCtx.fillStyle = '#00c853';
+                canvasCtx.font = 'bold 14px Segoe UI';
+                canvasCtx.textAlign = 'center';
+                canvasCtx.fillText('✓ Todos pregados! Novos em breve...', board.x + board.width/2, board.y + board.height + 20);
+            }
+        }
+
+        function drawTeachableMachinePanel() {
+            if (tmPanelAnim <= 0.01 || !tmPrediction) return;
+            const progress = tmPanelAnim;
+            const w = TM_PANEL_WIDTH * easeOutBack(progress);
+            const h = TM_PANEL_HEIGHT * progress;
+            const x = 20;
+            const y = 70 + (TM_PANEL_HEIGHT - h) / 2;
+            const alpha = progress;
+
+            canvasCtx.save();
+            canvasCtx.globalAlpha = alpha;
+
+            // Background
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.5)';
+            canvasCtx.shadowBlur = 20;
+            canvasCtx.shadowOffsetY = 8;
+            roundRect(x, y, w, h, 12, 'rgba(15, 20, 30, 0.92)');
+            canvasCtx.shadowColor = 'transparent';
+
+            // Top accent bar
+            const confidenceColor = tmConfidence > 0.9 ? '#00c853' : tmConfidence > 0.75 ? '#ff9100' : '#2979ff';
+            canvasCtx.fillStyle = confidenceColor;
+            roundRect(x, y, w, 4, [12, 12, 0, 0], null, true);
+
+            // Label
+            canvasCtx.fillStyle = '#fff';
+            canvasCtx.font = 'bold 16px Segoe UI, sans-serif';
+            canvasCtx.textAlign = 'left';
+            canvasCtx.fillText('🔍 Equipamento Detetado', x + 14, y + 28);
+
+            // Component name
+            canvasCtx.fillStyle = confidenceColor;
+            canvasCtx.font = 'bold 22px Segoe UI, sans-serif';
+            canvasCtx.fillText(tmPrediction, x + 14, y + 60);
+
+            // Confidence bar
+            const barW = w - 28, barH = 8;
+            const barX = x + 14, barY = y + 78;
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.15)';
+            roundRect(barX, barY, barW, barH, 4, null, true);
+            canvasCtx.fillStyle = confidenceColor;
+            roundRect(barX, barY, barW * tmConfidence, barH, 4, null, true);
+
+            // Confidence text
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.7)';
+            canvasCtx.font = '12px Segoe UI';
+            canvasCtx.fillText(`Confiança: ${(tmConfidence * 100).toFixed(1)}%`, x + 14, y + 102);
+
+            canvasCtx.restore();
+        }
+
+        function drawVacationPanel() {
+            if (vacationPanelAnim <= 0.01 || !vacationData || vacationData.length === 0) return;
+            const progress = vacationPanelAnim;
+            const w = VACATION_PANEL_WIDTH * easeOutBack(progress);
+            const h = VACATION_PANEL_HEIGHT * easeOutBack(progress);
+            const x = canvasElement.width - w - 20;
+            const y = 80 + (VACATION_PANEL_HEIGHT - h) / 2;
+            const person = vacationData[0]; // Show first person or could cycle through
+
+            canvasCtx.save();
+            canvasCtx.globalAlpha = progress;
+
+            // Shadow
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.5)';
+            canvasCtx.shadowBlur = 25;
+            canvasCtx.shadowOffsetY = 10;
+            roundRect(x, y, w, h, 14, 'rgba(15, 20, 30, 0.92)');
+            canvasCtx.shadowColor = 'transparent';
+
+            // Top accent
+            const grad = canvasCtx.createLinearGradient(x, y, x + w, y);
+            grad.addColorStop(0, '#00c853');
+            grad.addColorStop(0.5, '#2979ff');
+            grad.addColorStop(1, '#ff9100');
+            canvasCtx.fillStyle = grad;
+            roundRect(x, y, w, 4, [14, 14, 0, 0], null, true);
+
+            // Title
+            canvasCtx.fillStyle = '#fff';
+            canvasCtx.font = 'bold 16px Segoe UI, sans-serif';
+            canvasCtx.textAlign = 'left';
+            canvasCtx.fillText('🏖️ Férias - ' + (person.colaborador || 'Colaborador'), x + 16, y + 30);
+
+            // Close button
+            drawCloseButton(x + w - 40, y + 6, isOverVacationX(pointerX, pointerY, x, y, w));
+
+            // Data cards
+            const cards = [
+                { label: 'Total Anual', value: person.totalAnual, icon: '🏖️', color: '#00c853', sub: 'dias por ano' },
+                { label: 'Dias Usados', value: person.diasUsados, icon: '✅', color: '#2979ff', sub: 'dias gozados' },
+                { label: 'Disponíveis', value: person.diasDisponiveis, icon: '🎉', color: '#ff9100', sub: 'dias disponíveis' }
+            ];
+
+            const cardW = (w - 48) / 3;
+            const cardH = 100;
+            const cardY = y + 50;
+
+            cards.forEach((card, i) => {
+                const cx = x + 12 + i * (cardW + 8);
+                // Card bg
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.06)';
+                roundRect(cx, cardY, cardW, cardH, 10, null, true);
+
+                // Icon
+                canvasCtx.font = '20px Segoe UI';
+                canvasCtx.textAlign = 'center';
+                canvasCtx.fillText(card.icon, cx + cardW/2, cardY + 28);
+
+                // Value
+                canvasCtx.fillStyle = card.color;
+                canvasCtx.font = 'bold 28px Segoe UI';
+                canvasCtx.fillText(card.value.toString(), cx + cardW/2, cardY + 58);
+
+                // Label
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.7)';
+                canvasCtx.font = 'bold 10px Segoe UI';
+                canvasCtx.fillText(card.label, cx + cardW/2, cardY + 76);
+
+                // Sub
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.4)';
+                canvasCtx.font = '9px Segoe UI';
+                canvasCtx.fillText(card.sub, cx + cardW/2, cardY + 90);
+            });
+
+            // Progress bar for used vs total
+            const barY = cardY + cardH + 15;
+            const barW = w - 32;
+            const usedPct = person.totalAnual > 0 ? person.diasUsados / person.totalAnual : 0;
+
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.1)';
+            roundRect(x + 16, barY, barW, 10, 5, null, true);
+
+            const usedGrad = canvasCtx.createLinearGradient(x + 16, barY, x + 16 + barW * usedPct, barY);
+            usedGrad.addColorStop(0, '#2979ff');
+            usedGrad.addColorStop(1, '#00c853');
+            canvasCtx.fillStyle = usedGrad;
+            roundRect(x + 16, barY, barW * usedPct, 10, 5, null, true);
+
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.5)';
+            canvasCtx.font = '10px Segoe UI';
+            canvasCtx.textAlign = 'left';
+            canvasCtx.fillText(`${Math.round(usedPct * 100)}% usado | ${person.diasDisponiveis} restantes`, x + 16, barY + 24);
+
+            canvasCtx.restore();
+        }
+
+        function isOverVacationX(x, y, px, py, w) {
+            return x >= px + w - 44 && x <= px + w - 4 && y >= py + 6 && y <= py + 38;
+        }
+
+        function drawSamplePanel() {
+            if (samplePanelAnim <= 0.01 || !tmPrediction) return;
+            const progress = samplePanelAnim;
+            const w = SAMPLE_PANEL_WIDTH * easeOutBack(progress);
+            const h = SAMPLE_PANEL_HEIGHT * easeOutBack(progress);
+            const x = (canvasElement.width - w) / 2;
+            const y = 100 + (SAMPLE_PANEL_HEIGHT - h) / 2;
+            const img = sampleImages[tmPrediction];
+
+            canvasCtx.save();
+            canvasCtx.globalAlpha = progress;
+
+            // Shadow
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.6)';
+            canvasCtx.shadowBlur = 30;
+            canvasCtx.shadowOffsetY = 15;
+            roundRect(x, y, w, h, 16, 'rgba(18, 22, 32, 0.95)');
+            canvasCtx.shadowColor = 'transparent';
+
+            // Top accent
+            canvasCtx.fillStyle = '#2979ff';
+            roundRect(x, y, w, 4, [16, 16, 0, 0], null, true);
+
+            // Title
+            canvasCtx.fillStyle = '#fff';
+            canvasCtx.font = 'bold 16px Segoe UI, sans-serif';
+            canvasCtx.textAlign = 'left';
+            canvasCtx.fillText('📸 Foto de Referência', x + 18, y + 32);
+
+            // Close button
+            drawCloseButton(x + w - 44, y + 6, isOverSampleX(pointerX, pointerY, x, y, w));
+
+            // Image area
+            const imgY = y + 46;
+            const imgH = h - 60;
+            const imgW = w - 36;
+            const imgX = x + 18;
+
+            if (img && img.complete) {
+                // Draw image with aspect ratio preservation
+                const aspect = img.width / img.height;
+                const boxAspect = imgW / imgH;
+                let drawW, drawH, drawX, drawY;
+                if (aspect > boxAspect) {
+                    drawW = imgW; drawH = imgW / aspect;
+                    drawX = imgX; drawY = imgY + (imgH - drawH) / 2;
+                } else {
+                    drawH = imgH; drawW = imgH * aspect;
+                    drawX = imgX + (imgW - drawW) / 2; drawY = imgY;
+                }
+                // Clip to rounded rect
+                canvasCtx.save();
+                roundRect(drawX, drawY, drawW, drawH, 8, null, true);
+                canvasCtx.clip();
+                canvasCtx.drawImage(img, drawX, drawY, drawW, drawH);
+                canvasCtx.restore();
+            } else {
+                // Placeholder
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.08)';
+                roundRect(imgX, imgY, imgW, imgH, 8, null, true);
+                canvasCtx.fillStyle = 'rgba(255,255,255,0.3)';
+                canvasCtx.font = '14px Segoe UI';
+                canvasCtx.textAlign = 'center';
+                canvasCtx.fillText('📷 Coloca foto em samples/' + tmPrediction + '.jpg', x + w/2, imgY + imgH/2);
+            }
+
+            // Label at bottom
+            canvasCtx.fillStyle = '#2979ff';
+            canvasCtx.font = 'bold 14px Segoe UI';
+            canvasCtx.textAlign = 'center';
+            canvasCtx.fillText(tmPrediction, x + w/2, y + h - 12);
+
+            canvasCtx.restore();
+        }
+
+        function isOverSampleX(x, y, px, py, w) {
+            return x >= px + w - 44 && x <= px + w - 4 && y >= py + 6 && y <= py + 38;
+        }
+
+        function drawMenu() {
+            const slideOffset = menuSlideOut * menuSlideDir * (MENU_WIDTH + 100) + menuDragOffset;
+            const w = MENU_WIDTH, h = getMenuHeight(), x = menuX + slideOffset, y = menuY;
+            const dragAlpha = Math.max(0.3, 1 - Math.abs(menuDragOffset) / (MENU_DISMISS_THRESHOLD * 1.5));
+            canvasCtx.save(); canvasCtx.globalAlpha = (1 - Math.abs(menuSlideOut) * 0.5) * dragAlpha;
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.6)'; canvasCtx.shadowBlur = 25; canvasCtx.shadowOffsetY = 10; roundRect(x, y, w, h, 14, 'rgba(15, 20, 30, 0.88)'); canvasCtx.shadowColor = 'transparent'; canvasCtx.shadowBlur = 0;
+            const grad = canvasCtx.createLinearGradient(x, y, x + w, y); grad.addColorStop(0, '#00c853'); grad.addColorStop(0.5, '#2979ff'); grad.addColorStop(1, '#ff9100'); canvasCtx.fillStyle = grad; roundRect(x, y, w, 4, [14, 14, 0, 0], null, true);
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.95)'; canvasCtx.font = 'bold 17px Segoe UI, sans-serif'; canvasCtx.textAlign = 'left'; canvasCtx.fillText('🛠️  Manutenção AR', x + 16, y + 30);
+            drawCloseButton(x + w - 40, y + 6, isOverMenuX(pointerX, pointerY));
+            for (let i = 0; i < menuItems.length; i++) {
+                const iy = y + HEADER_HEIGHT + i * ITEM_HEIGHT; const hovered = getMenuItemAt(pointerX, pointerY) === i; const active = submenuOpen && submenuParentIndex === i; const itemColor = menuItems[i].color;
+                if (hovered || active) { canvasCtx.fillStyle = active ? hexToRgba(itemColor, 0.35) : 'rgba(255,255,255,0.10)'; canvasCtx.fillRect(x + 3, iy + 1, w - 6, ITEM_HEIGHT - 2); }
+                canvasCtx.fillStyle = itemColor; canvasCtx.fillRect(x + 3, iy + 8, 3, ITEM_HEIGHT - 16);
+                if (i > 0) { canvasCtx.strokeStyle = 'rgba(255,255,255,0.05)'; canvasCtx.beginPath(); canvasCtx.moveTo(x + 14, iy); canvasCtx.lineTo(x + w - 14, iy); canvasCtx.stroke(); }
+                canvasCtx.fillStyle = hovered || active ? '#fff' : '#e0e0e0'; canvasCtx.font = '15px Segoe UI, sans-serif'; canvasCtx.textAlign = 'left'; canvasCtx.fillText(menuItems[i].icon + '  ' + menuItems[i].label, x + 18, iy + 33);
+                if (menuItems[i].sub && menuItems[i].sub.length > 0) { canvasCtx.fillStyle = active ? itemColor : '#888'; canvasCtx.font = '13px Segoe UI'; canvasCtx.textAlign = 'right'; canvasCtx.fillText('▶', x + w - 18, iy + 33); }
+            }
+            canvasCtx.restore();
+        }
+
+        function drawSubmenu() {
+            const w = SUBMENU_WIDTH, h = submenuHeight, x = submenuX, y = submenuY; const items = menuItems[submenuParentIndex].sub; const parentColor = menuItems[submenuParentIndex].color;
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.5)'; canvasCtx.shadowBlur = 20; canvasCtx.shadowOffsetY = 8; roundRect(x, y, w, h, 12, 'rgba(20, 25, 35, 0.92)'); canvasCtx.shadowColor = 'transparent'; canvasCtx.shadowBlur = 0;
+            canvasCtx.fillStyle = parentColor; roundRect(x, y, w, 4, [12, 12, 0, 0], null, true); canvasCtx.fillStyle = 'rgba(255,255,255,0.95)'; canvasCtx.font = 'bold 15px Segoe UI, sans-serif'; canvasCtx.textAlign = 'left'; canvasCtx.fillText(menuItems[submenuParentIndex].label, x + 16, y + 29);
+            drawCloseButton(x + w - 40, y + 6, isOverSubmenuX(pointerX, pointerY));
+            for (let i = 0; i < items.length; i++) { const iy = y + HEADER_HEIGHT + i * ITEM_HEIGHT; const hovered = getSubmenuItemAt(pointerX, pointerY) === i; if (hovered) { canvasCtx.fillStyle = hexToRgba(parentColor, 0.25); canvasCtx.fillRect(x + 3, iy + 1, w - 6, ITEM_HEIGHT - 2); } if (i > 0) { canvasCtx.strokeStyle = 'rgba(255,255,255,0.04)'; canvasCtx.beginPath(); canvasCtx.moveTo(x + 12, iy); canvasCtx.lineTo(x + w - 12, iy); canvasCtx.stroke(); } canvasCtx.fillStyle = hovered ? '#fff' : '#ddd'; canvasCtx.font = '14px Segoe UI, sans-serif'; canvasCtx.textAlign = 'left'; canvasCtx.fillText('•  ' + items[i], x + 18, iy + 33); }
+        }
+
+        function drawToolbox() {
+            const rows = Math.ceil(tools.length / TOOLBOX_COLS); const w = TOOLBOX_WIDTH; const h = HEADER_HEIGHT + rows * (TOOL_SIZE + TOOL_PADDING) + TOOL_PADDING * 2; const x = toolboxX, y = toolboxY;
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.6)'; canvasCtx.shadowBlur = 25; canvasCtx.shadowOffsetY = 10; roundRect(x, y, w, h, 16, 'rgba(25, 30, 40, 0.92)'); canvasCtx.shadowColor = 'transparent'; canvasCtx.shadowBlur = 0;
+            canvasCtx.fillStyle = '#ff6b35'; roundRect(x, y, w, 4, [16, 16, 0, 0], null, true); canvasCtx.fillStyle = '#fff'; canvasCtx.font = 'bold 18px Segoe UI, sans-serif'; canvasCtx.textAlign = 'left'; canvasCtx.fillText('🧰  Mala de Ferramentas', x + 16, y + 33);
+            drawCloseButton(x + w - 40, y + 8, isOverToolboxX(pointerX, pointerY));
+            const contentY = y + HEADER_HEIGHT + TOOL_PADDING;
+            for (let i = 0; i < tools.length; i++) { const col = i % TOOLBOX_COLS; const row = Math.floor(i / TOOLBOX_COLS); const tx = x + TOOL_PADDING + col * (TOOL_SIZE + TOOL_PADDING); const ty = contentY + row * (TOOL_SIZE + TOOL_PADDING); const hovered = selectedToolIdx === i; canvasCtx.fillStyle = hovered ? hexToRgba(tools[i].color, 0.3) : 'rgba(255,255,255,0.06)'; roundRect(tx, ty, TOOL_SIZE, TOOL_SIZE, 10, null, true); if (hovered) { canvasCtx.strokeStyle = tools[i].color; canvasCtx.lineWidth = 2; canvasCtx.stroke(); } canvasCtx.font = `${TOOL_SIZE * 0.5}px Segoe UI`; canvasCtx.textAlign = 'center'; canvasCtx.fillText(tools[i].icon, tx + TOOL_SIZE/2, ty + TOOL_SIZE/2 + 10); canvasCtx.fillStyle = hovered ? '#fff' : 'rgba(255,255,255,0.7)'; canvasCtx.font = hovered ? 'bold 11px Segoe UI' : '11px Segoe UI'; canvasCtx.fillText(tools[i].name, tx + TOOL_SIZE/2, ty + TOOL_SIZE + 14); }
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.4)'; canvasCtx.font = '12px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.fillText('Aponte e faça pinça para pegar', x + w/2, y + h - 10);
+        }
+
+        function drawHeldTool() {
+            drawLanternLight(); drawLevel();
+            const tool = holdingTool; const x = tool.x, y = tool.y, scale = tool.scale, rotation = tool.rotation * (Math.PI / 180); let extraRotation = 0;
+            if (tool.key === 'martelo' && hammerSwing > 0) extraRotation = Math.sin(hammerSwing * Math.PI) * 60 * (Math.PI / 180);
+            canvasCtx.save(); canvasCtx.translate(x, y); canvasCtx.rotate(rotation + extraRotation); canvasCtx.scale(scale, scale);
+            canvasCtx.beginPath(); canvasCtx.arc(0, 0, 35, 0, Math.PI * 2); canvasCtx.fillStyle = hexToRgba(tool.color, 0.15); canvasCtx.fill();
+            canvasCtx.beginPath(); canvasCtx.arc(0, 0, 28, 0, Math.PI * 2); canvasCtx.fillStyle = 'rgba(20, 25, 35, 0.9)'; canvasCtx.fill(); canvasCtx.strokeStyle = tool.color; canvasCtx.lineWidth = 2; canvasCtx.stroke();
+            canvasCtx.font = '32px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.textBaseline = 'middle'; canvasCtx.fillText(tool.icon, 0, 0);
+            canvasCtx.restore();
+            canvasCtx.fillStyle = 'rgba(0,0,0,0.7)'; roundRect(x - 70, y - 55, 140, 22, 6, null, true); canvasCtx.fillStyle = tool.color; canvasCtx.font = 'bold 12px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.fillText(tool.name, x, y - 40); canvasCtx.fillStyle = 'rgba(255,255,255,0.5)'; canvasCtx.font = '11px Segoe UI'; canvasCtx.fillText(tool.desc, x, y + 45);
+        }
+
+        function drawPanel() {
+            if (!activePanel) return; const progress = panelAnimProgress; if (progress <= 0.01) return;
+            const w = PANEL_WIDTH * easeOutBack(progress); const h = PANEL_HEIGHT * easeOutBack(progress); const x = activePanel.x + (PANEL_WIDTH - w) / 2; const y = activePanel.y + (PANEL_HEIGHT - h) / 2; const color = activePanel.color;
+            canvasCtx.fillStyle = `rgba(0,0,0,${0.5 * progress})`; canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.shadowColor = 'rgba(0,0,0,0.6)'; canvasCtx.shadowBlur = 30 * progress; canvasCtx.shadowOffsetY = 15 * progress; roundRect(x, y, w, h, 16, 'rgba(18, 22, 32, 0.95)'); canvasCtx.shadowColor = 'transparent'; canvasCtx.shadowBlur = 0;
+            canvasCtx.fillStyle = color; roundRect(x, y, w, 4, [16, 16, 0, 0], null, true); canvasCtx.fillStyle = `rgba(255,255,255,${progress})`; canvasCtx.font = `bold ${16 * progress}px Segoe UI, sans-serif`; canvasCtx.textAlign = 'left'; canvasCtx.fillText(activePanel.title, x + 18, y + 32);
+            if (progress > 0.5) { drawCloseButton(x + w - 44, y + 6, isOverPanelX(pointerX, pointerY)); }
+            if (progress > 0.6) { const contentOpacity = Math.min((progress - 0.6) / 0.4, 1); canvasCtx.globalAlpha = contentOpacity; drawPanelContent(x, y + HEADER_HEIGHT + 10, w, h - HEADER_HEIGHT - 20, activePanel); canvasCtx.globalAlpha = 1; }
+        }
+
+        function drawPanelContent(px, py, pw, ph, panel) { const type = panel.type; const data = panel.data; const color = panel.color; if (type === 'bars') drawBarChart(px, py, pw, ph, data, color); else if (type === 'gauge') drawGaugeChart(px, py, pw, ph, data, color); else if (type === 'list') drawListView(px, py, pw, ph, data, color); }
+
+        function drawBarChart(px, py, pw, ph, data, color) {
+            const items = data.items; const maxVal = Math.max(...items.map(i => i.value || i.mtbf || 0)); const barW = (pw - 60) / items.length - 8; const chartH = ph - 80; const baseY = py + chartH + 30;
+            canvasCtx.strokeStyle = 'rgba(255,255,255,0.15)'; canvasCtx.lineWidth = 1; canvasCtx.beginPath(); canvasCtx.moveTo(px + 40, py + 20); canvasCtx.lineTo(px + 40, baseY); canvasCtx.lineTo(px + pw - 20, baseY); canvasCtx.stroke();
+            for (let i = 0; i <= 4; i++) { const gy = py + 20 + (chartH * i / 4); canvasCtx.strokeStyle = 'rgba(255,255,255,0.05)'; canvasCtx.beginPath(); canvasCtx.moveTo(px + 40, gy); canvasCtx.lineTo(px + pw - 20, gy); canvasCtx.stroke(); canvasCtx.fillStyle = 'rgba(255,255,255,0.4)'; canvasCtx.font = '10px Segoe UI'; canvasCtx.textAlign = 'right'; canvasCtx.fillText(Math.round(maxVal * (1 - i/4)).toString(), px + 35, gy + 3); }
+            items.forEach((item, i) => { const val = item.value || item.mtbf || 0; const barH = (val / maxVal) * chartH; const bx = px + 50 + i * (barW + 12); const by = baseY - barH; const grad = canvasCtx.createLinearGradient(bx, by, bx, baseY); grad.addColorStop(0, color); grad.addColorStop(1, hexToRgba(color, 0.3)); canvasCtx.fillStyle = grad; roundRect(bx, by, barW, barH, [4, 4, 0, 0], null, true); canvasCtx.fillStyle = '#fff'; canvasCtx.font = 'bold 10px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.fillText(val.toString(), bx + barW/2, by - 6); canvasCtx.fillStyle = 'rgba(255,255,255,0.6)'; canvasCtx.font = '9px Segoe UI'; canvasCtx.fillText(item.label, bx + barW/2, baseY + 14); });
+            if (data.title === 'MTBF / MTTR') { canvasCtx.fillStyle = 'rgba(255,255,255,0.5)'; canvasCtx.font = '11px Segoe UI'; canvasCtx.textAlign = 'left'; canvasCtx.fillText('Valores em horas (MTBF)', px + 50, py + chartH + 55); }
+        }
+
+        function drawGaugeChart(px, py, pw, ph, data, color) {
+            const items = data.items; const cols = 2; const rows = Math.ceil(items.length / cols); const cellW = (pw - 40) / cols; const cellH = (ph - 40) / rows;
+            items.forEach((item, i) => { const cx = px + 20 + (i % cols) * cellW + cellW/2; const cy = py + 20 + Math.floor(i / cols) * cellH + cellH/2; const radius = Math.min(cellW, cellH) * 0.35; const value = item.value; const angle = (value / 100) * Math.PI - Math.PI; canvasCtx.strokeStyle = 'rgba(255,255,255,0.1)'; canvasCtx.lineWidth = 10; canvasCtx.beginPath(); canvasCtx.arc(cx, cy, radius, Math.PI, 0); canvasCtx.stroke(); const grad = canvasCtx.createLinearGradient(cx - radius, cy, cx + radius, cy); grad.addColorStop(0, '#ff5252'); grad.addColorStop(0.5, '#ff9100'); grad.addColorStop(1, color); canvasCtx.strokeStyle = grad; canvasCtx.lineWidth = 10; canvasCtx.lineCap = 'round'; canvasCtx.beginPath(); canvasCtx.arc(cx, cy, radius, Math.PI, angle); canvasCtx.stroke(); canvasCtx.lineCap = 'butt'; canvasCtx.fillStyle = '#fff'; canvasCtx.font = `bold ${Math.floor(radius * 0.5)}px Segoe UI`; canvasCtx.textAlign = 'center'; canvasCtx.fillText(value.toFixed(1) + '%', cx, cy + 5); canvasCtx.fillStyle = 'rgba(255,255,255,0.6)'; canvasCtx.font = '11px Segoe UI'; canvasCtx.fillText(item.label, cx, cy + radius + 18); });
+        }
+
+        function drawListView(px, py, pw, ph, data, color) {
+            const items = data.items; const rowH = 38; const startY = py + 10;
+            canvasCtx.fillStyle = 'rgba(255,255,255,0.08)'; roundRect(px + 10, startY, pw - 20, rowH, [8, 8, 0, 0], null, true); canvasCtx.fillStyle = 'rgba(255,255,255,0.5)'; canvasCtx.font = 'bold 11px Segoe UI'; canvasCtx.textAlign = 'left';
+            if (data.title === 'Lista de Ativos') { canvasCtx.fillText('Ativo', px + 20, startY + 24); canvasCtx.fillText('Estado', px + pw - 140, startY + 24); canvasCtx.fillText('Última', px + pw - 60, startY + 24); }
+            else if (data.title === 'Tarefas Pendentes') { canvasCtx.fillText('Tarefa', px + 20, startY + 24); canvasCtx.fillText('Prioridade', px + pw - 140, startY + 24); canvasCtx.fillText('Prazo', px + pw - 60, startY + 24); }
+            else { canvasCtx.fillText('Descrição', px + 20, startY + 24); canvasCtx.fillText('Data', px + pw - 140, startY + 24); canvasCtx.fillText('Tipo', px + pw - 60, startY + 24); }
+            items.forEach((item, i) => { const ry = startY + rowH + i * rowH; if (ry + rowH > py + ph) return; if (i % 2 === 0) { canvasCtx.fillStyle = 'rgba(255,255,255,0.03)'; canvasCtx.fillRect(px + 10, ry, pw - 20, rowH); } canvasCtx.fillStyle = '#e0e0e0'; canvasCtx.font = '12px Segoe UI'; canvasCtx.textAlign = 'left'; canvasCtx.fillText(item.label, px + 20, ry + 24); let statusColor = color; let statusText = item.status || item.prio || item.date || item.type || ''; if (item.status === 'OK') statusColor = '#00c853'; else if (item.status === 'Alerta') statusColor = '#ff9100'; else if (item.status === 'Crítico') statusColor = '#ff1744'; else if (item.prio === 'Alta') statusColor = '#ff9100'; else if (item.prio === 'Crítica') statusColor = '#ff1744'; else if (item.prio === 'Baixa') statusColor = '#00c853'; else if (item.type === 'Preventiva') statusColor = '#00c853'; else if (item.type === 'Corretiva') statusColor = '#ff9100'; canvasCtx.fillStyle = statusColor; canvasCtx.font = 'bold 11px Segoe UI'; canvasCtx.textAlign = 'center'; canvasCtx.fillText(statusText, px + pw - 100, ry + 24); canvasCtx.fillStyle = 'rgba(255,255,255,0.5)'; canvasCtx.font = '11px Segoe UI'; canvasCtx.textAlign = 'right'; canvasCtx.fillText(item.last || item.due || '', px + pw - 20, ry + 24); });
+        }
+
+        function easeOutBack(t) { const c1 = 1.70158; const c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); }
+
+        function drawPointer(x, y, pinching) {
+            const color = pinching ? '#00ff88' : '#00e5ff'; const r = pinching ? 14 : 9; const pulse = Math.sin(Date.now() / 200) * 3;
+            canvasCtx.beginPath(); canvasCtx.arc(x, y, r + 12 + pulse, 0, Math.PI * 2); canvasCtx.fillStyle = pinching ? 'rgba(0,255,136,0.12)' : 'rgba(0,200,255,0.12)'; canvasCtx.fill();
+            canvasCtx.beginPath(); canvasCtx.arc(x, y, r, 0, Math.PI * 2); canvasCtx.fillStyle = color; canvasCtx.fill(); canvasCtx.strokeStyle = '#fff'; canvasCtx.lineWidth = 2.5; canvasCtx.stroke();
+            canvasCtx.strokeStyle = color; canvasCtx.lineWidth = 1.5; canvasCtx.beginPath(); canvasCtx.moveTo(x - r - 8, y); canvasCtx.lineTo(x - r - 3, y); canvasCtx.moveTo(x + r + 3, y); canvasCtx.lineTo(x + r + 8, y); canvasCtx.moveTo(x, y - r - 8); canvasCtx.lineTo(x, y - r - 3); canvasCtx.moveTo(x, y + r + 3); canvasCtx.lineTo(x, y + r + 8); canvasCtx.stroke();
+        }
+
+        function drawCloseButton(x, y, hovered) { const s = 30; canvasCtx.fillStyle = hovered ? 'rgba(255,70,70,0.95)' : 'rgba(255,255,255,0.12)'; canvasCtx.beginPath(); canvasCtx.arc(x + s/2, y + s/2, s/2, 0, Math.PI * 2); canvasCtx.fill(); canvasCtx.strokeStyle = '#fff'; canvasCtx.lineWidth = 2; canvasCtx.beginPath(); canvasCtx.moveTo(x + 9, y + 9); canvasCtx.lineTo(x + s - 9, y + s - 9); canvasCtx.moveTo(x + s - 9, y + 9); canvasCtx.lineTo(x + 9, y + s - 9); canvasCtx.stroke(); }
+
+        function roundRect(x, y, w, h, r, fill, strokeOnly) { if (typeof r === 'number') r = [r, r, r, r]; canvasCtx.beginPath(); canvasCtx.moveTo(x + r[0], y); canvasCtx.lineTo(x + w - r[1], y); canvasCtx.quadraticCurveTo(x + w, y, x + w, y + r[1]); canvasCtx.lineTo(x + w, y + h - r[2]); canvasCtx.quadraticCurveTo(x + w, y + h, x + w - r[2], y + h); canvasCtx.lineTo(x + r[3], y + h); canvasCtx.quadraticCurveTo(x, y + h, x, y + h - r[3]); canvasCtx.lineTo(x, y + r[0]); canvasCtx.quadraticCurveTo(x, y, x + r[0], y); canvasCtx.closePath(); if (fill) { canvasCtx.fillStyle = fill; canvasCtx.fill(); } if (strokeOnly) canvasCtx.fill(); }
+
+        function hexToRgba(hex, alpha) { const r = parseInt(hex.slice(1, 3), 16); const g = parseInt(hex.slice(3, 5), 16); const b = parseInt(hex.slice(5, 7), 16); return `rgba(${r}, ${g}, ${b}, ${alpha})`; }
+
+        function updateStatus(text) { document.getElementById('status').textContent = text; }
+    </script>
+</body>
+</html>
