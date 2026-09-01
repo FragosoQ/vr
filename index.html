@@ -15,18 +15,22 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         #container { position: relative; width: 100vw; height: 100vh; }
-        #video_input { position: absolute; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #video_input { position: absolute; width: 100%; height: 100%; object-fit: cover; }
+        #video_input.mirrored { transform: scaleX(-1); }
         #canvas_overlay { position: absolute; width: 100%; height: 100%; }
         #status { position: absolute; top: 15px; left: 15px; color: #0f0; font-size: 14px; background: rgba(0,0,0,0.6); padding: 8px 14px; border-radius: 8px; pointer-events: none; z-index: 10; }
         #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 20px; background: rgba(0,0,0,0.8); padding: 20px 30px; border-radius: 12px; z-index: 20; }
+        #cameraSwitchBtn { position: absolute; top: 15px; right: 15px; z-index: 15; width: 46px; height: 46px; border-radius: 50%; background: rgba(0,0,0,0.6); color: #fff; border: 2px solid rgba(255,255,255,0.35); font-size: 22px; line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+        #cameraSwitchBtn:active { background: rgba(255,255,255,0.25); }
     </style>
 </head>
 <body>
     <div id="container">
         <div id="loading">A iniciar câmara e MediaPipe...</div>
         <div id="status">Aguarda palma da mão...</div>
-        <video id="video_input" playsinline></video>
+        <video id="video_input" playsinline class="mirrored"></video>
         <canvas id="canvas_overlay"></canvas>
+        <button id="cameraSwitchBtn" title="Trocar câmara" aria-label="Trocar câmara">🔄</button>
     </div>
 
     <script>
@@ -36,6 +40,7 @@
         const TOOLBOX_WIDTH = 340, TOOLBOX_COLS = 3, TOOL_SIZE = 80, TOOL_PADDING = 15;
 
         let videoElement, canvasElement, canvasCtx, hands, camera, isLoaded = false, audioCtx = null;
+        let currentStream = null, currentFacingMode = 'user', cameraSwitching = false, cameraFrameId = null;
         let menuOpen = false, submenuOpen = false, submenuParentIndex = -1, menuX = 0, menuY = 0, submenuX = 0, submenuY = 0, submenuHeight = 0;
         let palmStartTime = null, palmTriggered = false, lastPinchTime = 0, isPinching = false, pointerX = 0, pointerY = 0;
         let activePanel = null, panelAnimProgress = 0, panelTargetProgress = 0;
@@ -225,8 +230,51 @@
             canvasCtx = canvasElement.getContext('2d');
             const resize = () => { canvasElement.width = window.innerWidth; canvasElement.height = window.innerHeight; if (board) { board.width = Math.min(500, canvasElement.width * 0.7); board.x = (canvasElement.width - board.width) / 2; board.y = canvasElement.height - 140; spawnNails(); } };
             resize(); window.addEventListener('resize', resize);
+            document.getElementById('cameraSwitchBtn').addEventListener('click', switchCamera);
             initAudio(); initTeachableMachine(); loadVacationData(); loadSampleImages(); initMediaPipe(); animate();
         };
+
+        async function switchCamera() {
+            if (cameraSwitching) return;
+            const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+            try {
+                await startCamera(nextFacingMode);
+                updateStatus(nextFacingMode === 'user' ? 'Câmara frontal' : 'Câmara traseira');
+            } catch (e) {
+                console.warn('Não foi possível trocar de câmara:', e);
+                updateStatus('Não foi possível trocar de câmara');
+            }
+        }
+
+        async function startCamera(facingMode) {
+            if (cameraSwitching) return;
+            cameraSwitching = true;
+            try {
+                if (cameraFrameId) { cancelAnimationFrame(cameraFrameId); cameraFrameId = null; }
+                if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
+                const constraints = { audio: false, video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } } };
+                let stream;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (e) {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+                }
+                currentStream = stream;
+                currentFacingMode = facingMode;
+                videoElement.srcObject = stream;
+                videoElement.classList.toggle('mirrored', facingMode === 'user');
+                await new Promise((resolve) => { videoElement.onloadedmetadata = () => resolve(); });
+                await videoElement.play();
+                cameraFrameLoop();
+            } finally {
+                cameraSwitching = false;
+            }
+        }
+
+        async function cameraFrameLoop() {
+            if (videoElement.readyState >= 2) { await hands.send({ image: videoElement }); }
+            cameraFrameId = requestAnimationFrame(cameraFrameLoop);
+        }
 
         function initAudio() { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
 
@@ -529,10 +577,9 @@
             hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
             hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
             hands.onResults(onResults);
-            camera = new Camera(videoElement, { onFrame: async () => { await hands.send({ image: videoElement }); }, width: 1280, height: 720 });
-            camera.start().then(() => { 
-                document.getElementById('loading').style.display = 'none'; 
-                isLoaded = true; 
+            startCamera(currentFacingMode).then(() => {
+                document.getElementById('loading').style.display = 'none';
+                isLoaded = true;
                 setTimeout(logSetupSummary, 2000); // Log summary after everything loads
             }).catch(err => { document.getElementById('loading').textContent = 'Erro câmara: ' + err.message; });
         }
@@ -570,7 +617,9 @@
             canvasCtx.save(); canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
             if (results.multiHandLandmarks) {
                 for (const landmarks of results.multiHandLandmarks) {
-                    const mirrored = landmarks.map(l => ({ x: 1 - l.x, y: l.y, z: l.z }));
+                    const mirrored = currentFacingMode === 'user'
+                        ? landmarks.map(l => ({ x: 1 - l.x, y: l.y, z: l.z }))
+                        : landmarks.map(l => ({ x: l.x, y: l.y, z: l.z }));
                     drawConnectors(canvasCtx, mirrored, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 2 });
                     drawLandmarks(canvasCtx, mirrored, { color: '#FF0000', lineWidth: 1, radius: 3 });
                     processGestures(mirrored);
